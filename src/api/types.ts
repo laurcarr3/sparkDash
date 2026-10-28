@@ -328,6 +328,59 @@ export interface LlmMetrics {
   error: string | null;
 }
 
+// ─── Spark Manager model registry ───────────────────────
+export interface ModelLaunchOptionChoice {
+  id: string;
+  label: string;
+  description?: string;
+  environment: Record<string, string>;
+}
+
+export interface ModelLaunchOption {
+  id: string;
+  label: string;
+  description?: string;
+  defaultChoice?: string;
+  choices: ModelLaunchOptionChoice[];
+}
+
+export interface RegisteredModel {
+  displayName: string;
+  workspaceDirectory: string;
+  launchOptions?: ModelLaunchOption[];
+}
+
+export interface SparkManagerCommandResult {
+  exitCode: number;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+}
+
+export interface RegisteredModelStatus extends RegisteredModel {
+  command?: SparkManagerCommandResult;
+  error?: { message: string };
+}
+
+export interface RegisteredModelsResponse {
+  models: RegisteredModel[];
+}
+
+export interface RegisteredModelStatusesResponse {
+  models: RegisteredModelStatus[];
+}
+
+export interface StartRegisteredModelRequest {
+  switchRunning?: boolean;
+  launchOptionSelections?: Record<string, string>;
+}
+
+export interface ModelLifecycleResponse {
+  model: RegisteredModel | { displayName: string };
+  stoppedModels?: RegisteredModel[];
+  command: SparkManagerCommandResult;
+}
+
 /** One UTC day of busy tok/s rollups (null avg = no busy samples). */
 export interface LlmDailyDay {
   date: string;

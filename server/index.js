@@ -1,5 +1,6 @@
 import express from "express";
 import { createServer } from "http";
+import { randomUUID } from "crypto";
 import { WebSocketServer } from "ws";
 import { spawn } from "child_process";
 import fs from "fs";
@@ -38,6 +39,11 @@ import { formatLlmBaseUrl, parseLlmTargetInput } from "../src/shared/llmTarget.j
 import { llmDaily } from "./collectors/LlmDaily.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
+import {
+  discoverSparkManagerModels,
+  fetchSparkManager,
+  requestSparkManager,
+} from "./collectors/SparkManager.js";
 import { FLEET_ENERGY_JSON_PATH } from "./config.js";
 import { FleetEnergyTracker } from "./energy/FleetEnergyTracker.js";
 import {
@@ -311,6 +317,45 @@ const fleetEnergyRuntime = createFleetEnergyRuntime({
 const app = express();
 const server = createServer(app);
 
+app.use((req, res, next) => {
+  if (
+    req.method !== "POST" ||
+    !/^\/api\/sparks\/[^/]+\/models\/[^/]+\/(?:start|stop)$/.test(req.path)
+  ) return next();
+  const incomingRequestId = req.get("x-request-id") || "";
+  const requestId = /^[A-Za-z0-9._:-]{1,128}$/.test(incomingRequestId)
+    ? incomingRequestId
+    : randomUUID();
+  const startedAt = performance.now();
+  res.locals.requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+  console.info(JSON.stringify({
+    service: "sparkdash",
+    component: "http-api",
+    event: "request.started",
+    requestId,
+    method: req.method,
+    path: req.originalUrl,
+    contentType: req.get("content-type") || null,
+    contentLength: req.get("content-length") || null,
+    authorizationPresent: Boolean(req.get("authorization")),
+    remoteAddress: req.ip,
+  }));
+  res.once("finish", () => {
+    const entry = JSON.stringify({
+      service: "sparkdash",
+      component: "http-api",
+      event: "request.completed",
+      requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+    });
+    (res.statusCode >= 400 ? console.warn : console.info)(entry);
+  });
+  next();
+});
 app.use(express.json());
 app.use(createAuthMiddleware());
 
@@ -496,6 +541,130 @@ app.get("/api/sparks/:id/metrics", (req, res) => {
   const monitor = monitors.get(req.params.id);
   if (!monitor) return res.status(404).json({ error: "Spark not found" });
   res.json(monitor.snapshot());
+});
+
+// Spark Manager is loopback-only. Proxy discovery and lifecycle requests
+// through the backend (and an SSH loopback tunnel for remote Sparks) so the
+// browser never needs direct access or the optional manager token.
+app.get("/api/sparks/:id/models", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    res.json(await discoverSparkManagerModels(spark, { requestId: res.locals.requestId }));
+  } catch (err) {
+    res.status(err.status || 502).json(
+      err.payload || { error: { code: "SPARK_MANAGER_UNAVAILABLE", message: err.message } }
+    );
+  }
+});
+
+app.get("/api/sparks/:id/models/status", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    const [registered, running] = await Promise.all([
+      discoverSparkManagerModels(spark, { requestId: res.locals.requestId }),
+      fetchSparkManager(spark, "/models/running", { requestId: res.locals.requestId }),
+    ]);
+    const runningNames = new Set(running.models.map((model) => model.displayName));
+    res.json({
+      models: registered.models.map((model) => ({
+        ...model,
+        command: {
+          exitCode: 0,
+          signal: null,
+          stdout: runningNames.has(model.displayName) ? "running\n" : "stopped\n",
+          stderr: "",
+        },
+      })),
+    });
+  } catch (err) {
+    res.status(err.status || 502).json(
+      err.payload || { error: { code: "SPARK_MANAGER_UNAVAILABLE", message: err.message } }
+    );
+  }
+});
+
+function parseModelStartBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    const error = new Error("Request body must be a JSON object");
+    error.status = 400;
+    throw error;
+  }
+  const allowed = new Set(["switchRunning", "launchOptionSelections"]);
+  const unexpected = Object.keys(body).find((key) => !allowed.has(key));
+  if (unexpected) {
+    const error = new Error(`Unexpected request field: ${unexpected}`);
+    error.status = 400;
+    throw error;
+  }
+  if (body.switchRunning !== undefined && typeof body.switchRunning !== "boolean") {
+    const error = new Error("switchRunning must be a boolean");
+    error.status = 400;
+    throw error;
+  }
+  const selections = body.launchOptionSelections ?? {};
+  if (!selections || typeof selections !== "object" || Array.isArray(selections)) {
+    const error = new Error("launchOptionSelections must be an object");
+    error.status = 400;
+    throw error;
+  }
+  for (const [optionId, choiceId] of Object.entries(selections)) {
+    if (
+      !/^[A-Za-z][A-Za-z0-9._-]*$/.test(optionId) ||
+      typeof choiceId !== "string" ||
+      !/^[A-Za-z][A-Za-z0-9._-]*$/.test(choiceId)
+    ) {
+      const error = new Error("Launch option and choice IDs are invalid");
+      error.status = 400;
+      throw error;
+    }
+  }
+  return {
+    switchRunning: body.switchRunning ?? false,
+    launchOptionSelections: selections,
+  };
+}
+
+app.post("/api/sparks/:id/models/:displayName/start", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    const body = parseModelStartBody(req.body);
+    const name = encodeURIComponent(req.params.displayName);
+    res.json(
+      await requestSparkManager(spark, `/models/${name}/start`, {
+        method: "POST",
+        body,
+        timeoutMs: 15 * 60_000,
+        requestId: res.locals.requestId,
+      })
+    );
+  } catch (err) {
+    res.status(err.status || 502).json(
+      err.payload || { error: { code: "SPARK_MANAGER_ERROR", message: err.message } }
+    );
+  }
+});
+
+app.post("/api/sparks/:id/models/:displayName/stop", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    const name = encodeURIComponent(req.params.displayName);
+    res.json(
+      await requestSparkManager(spark, `/models/${name}/stop`, {
+        method: "POST",
+        body: {},
+        timeoutMs: 5 * 60_000,
+        requestId: res.locals.requestId,
+      })
+    );
+  } catch (err) {
+    res.status(err.status || 502).json(
+      err.payload || { error: { code: "SPARK_MANAGER_ERROR", message: err.message } }
+    );
+  }
 });
 
 // Test SSH + LLM connectivity for a registered Spark.

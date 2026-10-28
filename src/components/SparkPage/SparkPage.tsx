@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, type CSSProperties } from "react";
 import type { SparkSnapshot } from "../../api/types";
 import { isLlmMonitoringEnabled } from "../../api/sparkRole";
+import { resolveSparkRole } from "../../api/sparkRole";
 import { updateSpark, refreshSparkMetric, addLlmPort, removeLlmPort } from "../../api/client";
 import { SparkHeader } from "./SparkHeader";
 import { SparkActions } from "./SparkActions";
@@ -12,6 +13,7 @@ import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
 import { ChevronDownIcon } from "../ui/icons";
+import { ModelAvailabilityPanel } from "./ModelAvailabilityPanel";
 
 interface SparkPageProps {
   spark: SparkSnapshot;
@@ -22,6 +24,7 @@ interface SparkPageProps {
 const SECTION_OPEN_KEYS = {
   resources: "sparkdash.ui.section.resources",
   services: "sparkdash.ui.section.services",
+  models: "sparkdash.ui.section.models",
 } as const;
 
 function readSectionOpen(key: string, fallback = true): boolean {
@@ -94,6 +97,9 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
   const [servicesOpen, setServicesOpen] = useState(() =>
     readSectionOpen(SECTION_OPEN_KEYS.services, true)
   );
+  const [modelsOpen, setModelsOpen] = useState(() =>
+    readSectionOpen(SECTION_OPEN_KEYS.models, true)
+  );
 
   const toggleResources = useCallback(() => {
     setResourcesOpen((prev) => {
@@ -107,6 +113,14 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
     setServicesOpen((prev) => {
       const next = !prev;
       writeSectionOpen(SECTION_OPEN_KEYS.services, next);
+      return next;
+    });
+  }, []);
+
+  const toggleModels = useCallback(() => {
+    setModelsOpen((prev) => {
+      const next = !prev;
+      writeSectionOpen(SECTION_OPEN_KEYS.models, next);
       return next;
     });
   }, []);
@@ -180,6 +194,10 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
   /** First LLM + Comfy share a row when both are on. */
   const primarySideBySide = llmOn && comfyOn;
   const showServices = llmOn || comfyOn;
+  const showModels = resolveSparkRole(spark) !== "worker";
+  const servedModelIds = (metrics.llm || [])
+    .filter((llm) => llm?.available && llm.modelId)
+    .map((llm) => llm.modelId as string);
   const primaryPort = llmPorts[0];
   const extraPorts = llmPorts.slice(1);
 
@@ -288,6 +306,21 @@ export function SparkPage({ spark, temperatureUnit, onEdit }: SparkPageProps) {
               </>
             )}
           </>
+        )}
+        {showModels && (
+          <SectionHeading
+            title="Models"
+            open={modelsOpen}
+            onToggle={toggleModels}
+            style={{ marginTop: "var(--density-page-gap)" }}
+          />
+        )}
+        {showModels && modelsOpen && (
+          <ModelAvailabilityPanel
+            sparkId={spark.id}
+            servedModelIds={servedModelIds}
+            online={spark.online}
+          />
         )}
         {/*
           Services layout:

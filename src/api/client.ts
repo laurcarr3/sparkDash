@@ -16,14 +16,39 @@ import type {
   StartDecodeBenchRequest,
   PrefillBenchJob,
   PrefillBenchListResponse,
+  RegisteredModelsResponse,
+  RegisteredModelStatusesResponse,
+  ModelLifecycleResponse,
+  StartRegisteredModelRequest,
   StartPrefillBenchRequest,
 } from "./types";
 
 const BASE = "";
 const TOKEN = (typeof localStorage !== "undefined" && localStorage.getItem("sparkdashToken")) || "";
+const API_DEBUG = import.meta.env.DEV || import.meta.env.VITE_API_DEBUG === "1";
 
 function authHeaders(): Record<string, string> {
   return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
+}
+
+function requestId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `browser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function apiLog(
+  level: "debug" | "info" | "error",
+  event: string,
+  fields: Record<string, unknown>
+): void {
+  if (
+    !API_DEBUG ||
+    typeof fields.path !== "string" ||
+    !/^\/api\/sparks\/[^/]+\/models\/[^/]+\/(?:start|stop)$/.test(fields.path)
+  ) return;
+  console[level](`[sparkDash API] ${event}`, fields);
 }
 
 // ─── Generic fetch wrapper ────────────────────────────────
@@ -33,15 +58,76 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
   // (OPTIONS) in some proxy setups.
   const headers: Record<string, string> = {};
   if (opts?.body) headers["Content-Type"] = "application/json";
-  const res = await fetch(`${BASE}${path}`, {
-    ...opts,
-    headers: { ...headers, ...authHeaders(), ...(opts?.headers as Record<string, string> | undefined) },
+  const id = requestId();
+  const method = opts?.method || "GET";
+  const startedAt = performance.now();
+  const requestHeaders: Record<string, string> = {
+    ...headers,
+    ...authHeaders(),
+    ...(opts?.headers as Record<string, string> | undefined),
+    "X-Request-Id": id,
+  };
+  apiLog("info", "request started", {
+    requestId: id,
+    method,
+    path,
+    bodyBytes: typeof opts?.body === "string" ? new Blob([opts.body]).size : null,
+    contentType: requestHeaders["Content-Type"] || null,
+    authorizationPresent: Boolean(requestHeaders.Authorization),
   });
+
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      ...opts,
+      headers: requestHeaders,
+    });
+  } catch (error) {
+    apiLog("error", "network failure", {
+      requestId: id,
+      method,
+      path,
+      durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+      error: error instanceof Error
+        ? { name: error.name, message: error.message, stack: error.stack }
+        : String(error),
+    });
+    throw error;
+  }
+
+  const responseMetadata = {
+    requestId: id,
+    responseRequestId: res.headers.get("x-request-id"),
+    method,
+    path,
+    status: res.status,
+    statusText: res.statusText,
+    contentType: res.headers.get("content-type"),
+    durationMs: Math.round((performance.now() - startedAt) * 10) / 10,
+  };
+  apiLog(res.ok ? "info" : "error", "response received", responseMetadata);
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(body.error || `HTTP ${res.status}`);
+    const message =
+      typeof body.error === "string"
+        ? body.error
+        : body.error?.message || `HTTP ${res.status}`;
+    apiLog("error", "request rejected", {
+      ...responseMetadata,
+      errorCode: typeof body.error === "object" ? body.error?.code : undefined,
+      errorMessage: message,
+    });
+    throw new Error(message);
   }
-  return res.json();
+  try {
+    return await res.json();
+  } catch (error) {
+    apiLog("error", "invalid JSON response", {
+      ...responseMetadata,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
 // ─── Sparks CRUD ─────────────────────────────────────────
@@ -58,6 +144,41 @@ export function fetchSparkMetrics(id: string): Promise<{
   metrics?: { llm?: LlmMetrics[] };
 }> {
   return apiFetch(`/api/sparks/${id}/metrics`);
+}
+
+/** Registered models configured in Spark Manager (no status commands). */
+export function fetchRegisteredModels(id: string): Promise<RegisteredModelsResponse> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/models`);
+}
+
+/** Registered models plus each model's raw Spark Manager status result. */
+export function fetchRegisteredModelStatuses(
+  id: string
+): Promise<RegisteredModelStatusesResponse> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/models/status`);
+}
+
+/** Start a registered model with recipe-owned launch option selections. */
+export function startRegisteredModel(
+  id: string,
+  displayName: string,
+  request: StartRegisteredModelRequest
+): Promise<ModelLifecycleResponse> {
+  return apiFetch(
+    `/api/sparks/${encodeURIComponent(id)}/models/${encodeURIComponent(displayName)}/start`,
+    { method: "POST", body: JSON.stringify(request) }
+  );
+}
+
+/** Stop a registered model through Spark Manager. */
+export function stopRegisteredModel(
+  id: string,
+  displayName: string
+): Promise<ModelLifecycleResponse> {
+  return apiFetch(
+    `/api/sparks/${encodeURIComponent(id)}/models/${encodeURIComponent(displayName)}/stop`,
+    { method: "POST", body: JSON.stringify({}) }
+  );
 }
 
 /** Daily busy tok/s rollups for one Spark LLM port. */

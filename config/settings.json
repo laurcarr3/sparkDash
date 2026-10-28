@@ -2,7 +2,11 @@
   "pollIntervalMs": 1000,
   "defaultLlmPort": 8888,
   "autoHideOffline": false,
-  "temperatureUnit": "celsius",
+  "hideWorkers": false,
+  "temperatureUnit": "fahrenheit",
   "benchDebugTraces": false,
-  "density": "compact"
+  "density": "compact",
+  "showFleetEnergy": false,
+  "showFleetExceptions": false,
+  "showOverviewSearch": false
 }
