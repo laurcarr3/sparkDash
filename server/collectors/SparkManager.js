@@ -1,13 +1,11 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { onceClose, openSshLlmTunnel } from "./llmTunnel.js";
-import { sshExec } from "./ssh.js";
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_TIMEOUT_MS = 30_000;
-const REGISTRY_RELATIVE_PATH = ".spark-manager/registry.json";
+const DEFAULT_LOG_LIMIT = 200;
+const MAX_LOG_LIMIT = 1000;
+export const OPERATION_ID_PATTERN = /^op_[a-f0-9]{32}$/;
 
 function configuredPort() {
   const port = Number(process.env.SPARK_MANAGER_API_PORT || DEFAULT_PORT);
@@ -35,9 +33,75 @@ function describeError(error) {
   };
 }
 
+function validateEndpoint(endpoint) {
+  if (typeof endpoint !== "string" || !endpoint.startsWith("/")) return false;
+  let parsed;
+  try {
+    parsed = new URL(endpoint, "http://spark-manager.invalid");
+  } catch {
+    return false;
+  }
+  if (parsed.origin !== "http://spark-manager.invalid" || parsed.hash) return false;
+  const pathAllowed =
+    /^\/models(?:\/(?:status|running)|\/[^/]+\/(?:start|stop|status|logs))?$/.test(parsed.pathname) ||
+    OPERATION_ID_PATTERN.test(parsed.pathname.replace(/^\/operations\//, ""));
+  if (!pathAllowed) return false;
+  if (!parsed.search) return true;
+  if (!/\/models\/[^/]+\/logs$/.test(parsed.pathname)) return false;
+  return [...parsed.searchParams.keys()].every((key) => key === "after" || key === "limit");
+}
+
+/**
+ * Spark Manager's 409 MODEL_ALREADY_RUNNING lists whole registry entries in
+ * `runningModels`, including unmasked launch option environments and the raw
+ * readiness URL. The browser only needs to name them, so keep identity fields.
+ */
+export function sanitizeErrorPayload(payload) {
+  const error = payload?.error;
+  if (!error || typeof error !== "object" || !Array.isArray(error.runningModels)) return payload;
+  return {
+    ...payload,
+    error: {
+      ...error,
+      runningModels: error.runningModels
+        .filter((model) => model && typeof model.displayName === "string")
+        .map(({ displayName, workspaceDirectory }) => ({
+          displayName,
+          ...(typeof workspaceDirectory === "string" ? { workspaceDirectory } : {}),
+        })),
+    },
+  };
+}
+
+function invalidLogQuery(message) {
+  return upstreamError(message, 400, { error: { code: "INVALID_LOG_QUERY", message } });
+}
+
+/**
+ * Build the upstream logs endpoint from a browser query. Mirrors Spark
+ * Manager's own rules: only `after` (non-negative integer) and `limit`
+ * (1..1000), each at most once.
+ */
+export function buildLogsEndpoint(displayName, query = {}) {
+  const result = { after: 0, limit: DEFAULT_LOG_LIMIT };
+  for (const [name, value] of Object.entries(query)) {
+    if (name !== "after" && name !== "limit") {
+      throw invalidLogQuery(`Unexpected query parameter ${JSON.stringify(name)}`);
+    }
+    const number = typeof value === "string" && /^\d{1,16}$/.test(value) ? Number(value) : NaN;
+    const [min, max] = name === "after" ? [0, Number.MAX_SAFE_INTEGER] : [1, MAX_LOG_LIMIT];
+    if (!(number >= min && number <= max)) {
+      throw invalidLogQuery(`${name} must be a single integer from ${min} to ${max}`);
+    }
+    result[name] = number;
+  }
+  const params = new URLSearchParams({ after: String(result.after), limit: String(result.limit) });
+  return `/models/${encodeURIComponent(displayName)}/logs?${params}`;
+}
+
 /** Request a Spark Manager endpoint, tunneling loopback over SSH when remote. */
 export async function requestSparkManager(spark, endpoint, opts = {}) {
-  if (!/^\/models(?:\/(?:status|running)|\/[^/]+\/(?:start|stop))?$/.test(endpoint)) {
+  if (!validateEndpoint(endpoint)) {
     throw new Error("Unsupported Spark Manager endpoint");
   }
 
@@ -105,6 +169,7 @@ export async function requestSparkManager(spark, endpoint, opts = {}) {
 
     const payload = await response.json().catch(() => null);
     responseStatus = response.status;
+    opts.onResponse?.({ status: response.status });
     logger?.[response.ok ? "info" : "warn"](JSON.stringify({
       service: "sparkdash",
       component: "spark-manager-proxy",
@@ -121,7 +186,7 @@ export async function requestSparkManager(spark, endpoint, opts = {}) {
       throw upstreamError(
         payload?.error?.message || `Spark Manager returned HTTP ${response.status}`,
         response.status,
-        payload
+        sanitizeErrorPayload(payload)
       );
     }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -162,85 +227,4 @@ export async function fetchSparkManager(spark, endpoint, opts = {}) {
     throw upstreamError("Spark Manager returned an invalid models response");
   }
   return payload;
-}
-
-function registryCandidates(spark) {
-  const configured = String(process.env.SPARK_MANAGER_REGISTRY_PATH || "").trim();
-  if (configured) return [configured];
-
-  const candidates = [path.join(os.homedir(), REGISTRY_RELATIVE_PATH)];
-  const hostRoot = String(process.env.HOST_ROOT_PATH || "").trim();
-  const user = String(spark?.ssh?.user || "").trim();
-  if (hostRoot && user && /^[a-z_][a-z0-9_-]*[$]?$/i.test(user)) {
-    candidates.unshift(path.join(hostRoot, "home", user, REGISTRY_RELATIVE_PATH));
-  }
-  return [...new Set(candidates)];
-}
-
-function parseRegistry(raw, source) {
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch (cause) {
-    throw upstreamError(`Unable to parse Spark Manager registry ${source}: ${cause.message}`);
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw upstreamError(`Invalid Spark Manager registry ${source}: expected an object`);
-  }
-  return Object.entries(value).map(([displayName, entry]) => {
-    if (!displayName.trim() || !entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw upstreamError(`Invalid Spark Manager registry entry ${JSON.stringify(displayName)}`);
-    }
-    const workspaceDirectory = entry.workspaceDirectory;
-    if (typeof workspaceDirectory !== "string" || !workspaceDirectory.trim()) {
-      throw upstreamError(`Invalid workspaceDirectory for ${JSON.stringify(displayName)}`);
-    }
-    return {
-      displayName,
-      workspaceDirectory,
-      ...(Array.isArray(entry.launchOptions) ? { launchOptions: entry.launchOptions } : {}),
-    };
-  });
-}
-
-/** Read registry.json so new metadata need not wait on an API release. */
-export async function readSparkManagerRegistry(spark, opts = {}) {
-  const execRemote = opts.sshExecImpl || sshExec;
-  if (!spark?.isLocal) {
-    const raw = await execRemote(spark, 'cat "$HOME/.spark-manager/registry.json"', {
-      timeoutMs: opts.timeoutMs ?? 10_000,
-    });
-    return { models: parseRegistry(raw, "~/.spark-manager/registry.json") };
-  }
-
-  const readFileImpl = opts.readFileImpl || fs.readFile;
-  let lastError;
-  for (const candidate of opts.registryPaths || registryCandidates(spark)) {
-    try {
-      return { models: parseRegistry(await readFileImpl(candidate, "utf8"), candidate) };
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw upstreamError(`Unable to read Spark Manager registry: ${lastError?.message || "not found"}`);
-}
-
-/** Enrich live API data with registry-only fields such as launchOptions. */
-export async function discoverSparkManagerModels(spark, opts = {}) {
-  const apiPayload = await fetchSparkManager(spark, "/models", opts);
-  let registry;
-  try {
-    registry = await readSparkManagerRegistry(spark, opts);
-  } catch {
-    return apiPayload;
-  }
-  const byName = new Map(registry.models.map((model) => [model.displayName, model]));
-  return {
-    ...apiPayload,
-    models: apiPayload.models.map((model) => ({
-      ...byName.get(model.displayName),
-      ...model,
-      launchOptions: model.launchOptions ?? byName.get(model.displayName)?.launchOptions,
-    })),
-  };
 }

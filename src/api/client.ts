@@ -17,7 +17,9 @@ import type {
   PrefillBenchJob,
   PrefillBenchListResponse,
   RegisteredModelsResponse,
-  RegisteredModelStatusesResponse,
+  ModelLifecycleStatusesResponse,
+  ModelLifecycleLogsResponse,
+  ModelOperationResponse,
   ModelLifecycleResponse,
   StartRegisteredModelRequest,
   StartPrefillBenchRequest,
@@ -49,6 +51,21 @@ function apiLog(
     !/^\/api\/sparks\/[^/]+\/models\/[^/]+\/(?:start|stop)$/.test(fields.path)
   ) return;
   console[level](`[sparkDash API] ${event}`, fields);
+}
+
+/** Non-2xx API response. `code` and `details` come from `{ error: { code, message, ...details } }`. */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly details: Record<string, unknown>;
+
+  constructor(message: string, status: number, code?: string, details: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
 }
 
 // ─── Generic fetch wrapper ────────────────────────────────
@@ -112,12 +129,14 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
       typeof body.error === "string"
         ? body.error
         : body.error?.message || `HTTP ${res.status}`;
+    const { code, ...details }: Record<string, unknown> =
+      body.error && typeof body.error === "object" ? body.error : {};
     apiLog("error", "request rejected", {
       ...responseMetadata,
-      errorCode: typeof body.error === "object" ? body.error?.code : undefined,
+      errorCode: code,
       errorMessage: message,
     });
-    throw new Error(message);
+    throw new ApiRequestError(message, res.status, typeof code === "string" ? code : undefined, details);
   }
   try {
     return await res.json();
@@ -151,10 +170,10 @@ export function fetchRegisteredModels(id: string): Promise<RegisteredModelsRespo
   return apiFetch(`/api/sparks/${encodeURIComponent(id)}/models`);
 }
 
-/** Registered models plus each model's raw Spark Manager status result. */
+/** Each registered model's Spark Manager lifecycle status (GET /models/status, passed through). */
 export function fetchRegisteredModelStatuses(
   id: string
-): Promise<RegisteredModelStatusesResponse> {
+): Promise<ModelLifecycleStatusesResponse> {
   return apiFetch(`/api/sparks/${encodeURIComponent(id)}/models/status`);
 }
 
@@ -178,6 +197,29 @@ export function stopRegisteredModel(
   return apiFetch(
     `/api/sparks/${encodeURIComponent(id)}/models/${encodeURIComponent(displayName)}/stop`,
     { method: "POST", body: JSON.stringify({}) }
+  );
+}
+
+/** One page of the model's latest lifecycle operation log, after sequence `after`. */
+export function fetchRegisteredModelLogs(
+  id: string,
+  displayName: string,
+  after = 0,
+  limit = 200
+): Promise<ModelLifecycleLogsResponse> {
+  const query = new URLSearchParams({ after: String(after), limit: String(limit) });
+  return apiFetch(
+    `/api/sparks/${encodeURIComponent(id)}/models/${encodeURIComponent(displayName)}/logs?${query}`
+  );
+}
+
+/** One start or stop operation (status, timing, command result, error). */
+export function fetchRegisteredModelOperation(
+  id: string,
+  operationId: string
+): Promise<ModelOperationResponse> {
+  return apiFetch(
+    `/api/sparks/${encodeURIComponent(id)}/operations/${encodeURIComponent(operationId)}`
   );
 }
 

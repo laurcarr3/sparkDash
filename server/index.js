@@ -40,7 +40,8 @@ import { llmDaily } from "./collectors/LlmDaily.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
 import {
-  discoverSparkManagerModels,
+  OPERATION_ID_PATTERN,
+  buildLogsEndpoint,
   fetchSparkManager,
   requestSparkManager,
 } from "./collectors/SparkManager.js";
@@ -550,7 +551,7 @@ app.get("/api/sparks/:id/models", async (req, res) => {
   try {
     const spark = registry.getSpark(req.params.id);
     if (!spark) return res.status(404).json({ error: "Spark not found" });
-    res.json(await discoverSparkManagerModels(spark, { requestId: res.locals.requestId }));
+    res.json(await fetchSparkManager(spark, "/models", { requestId: res.locals.requestId }));
   } catch (err) {
     res.status(err.status || 502).json(
       err.payload || { error: { code: "SPARK_MANAGER_UNAVAILABLE", message: err.message } }
@@ -562,22 +563,10 @@ app.get("/api/sparks/:id/models/status", async (req, res) => {
   try {
     const spark = registry.getSpark(req.params.id);
     if (!spark) return res.status(404).json({ error: "Spark not found" });
-    const [registered, running] = await Promise.all([
-      discoverSparkManagerModels(spark, { requestId: res.locals.requestId }),
-      fetchSparkManager(spark, "/models/running", { requestId: res.locals.requestId }),
-    ]);
-    const runningNames = new Set(running.models.map((model) => model.displayName));
-    res.json({
-      models: registered.models.map((model) => ({
-        ...model,
-        command: {
-          exitCode: 0,
-          signal: null,
-          stdout: runningNames.has(model.displayName) ? "running\n" : "stopped\n",
-          stderr: "",
-        },
-      })),
-    });
+    // Passed through unchanged. Registry entries (GET /models) are fetched
+    // separately: both carry a `readiness` field with different shapes, so
+    // merging them here would overwrite the registry's probe config.
+    res.json(await fetchSparkManager(spark, "/models/status", { requestId: res.locals.requestId }));
   } catch (err) {
     res.status(err.status || 502).json(
       err.payload || { error: { code: "SPARK_MANAGER_UNAVAILABLE", message: err.message } }
@@ -585,29 +574,67 @@ app.get("/api/sparks/:id/models/status", async (req, res) => {
   }
 });
 
+app.get("/api/sparks/:id/models/:displayName/logs", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    const endpoint = buildLogsEndpoint(req.params.displayName, req.query);
+    res.json(await requestSparkManager(spark, endpoint, { requestId: res.locals.requestId }));
+  } catch (err) {
+    res.status(err.status || 502).json(
+      err.payload || { error: { code: "SPARK_MANAGER_ERROR", message: err.message } }
+    );
+  }
+});
+
+app.get("/api/sparks/:id/operations/:operationId", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    const operationId = String(req.params.operationId || "");
+    if (!OPERATION_ID_PATTERN.test(operationId)) {
+      return res.status(400).json({ error: { code: "INVALID_OPERATION_ID", message: "Invalid operation ID" } });
+    }
+    res.json(await requestSparkManager(spark, `/operations/${operationId}`, {
+      requestId: res.locals.requestId,
+    }));
+  } catch (err) {
+    res.status(err.status || 502).json(
+      err.payload || { error: { code: "SPARK_MANAGER_ERROR", message: err.message } }
+    );
+  }
+});
+
+function invalidModelRequest(message) {
+  const error = new Error(message);
+  error.status = 400;
+  error.payload = { error: { code: "INVALID_REQUEST", message } };
+  return error;
+}
+
+/** Relay Spark Manager's 202 + operation, pointing Location at sparkDash's operation route. */
+function sendLifecycleAccepted(res, sparkId, status, payload) {
+  if (status === 202 && OPERATION_ID_PATTERN.test(String(payload?.operationId || ""))) {
+    res.location(`/api/sparks/${encodeURIComponent(sparkId)}/operations/${payload.operationId}`);
+  }
+  res.status(status).json(payload);
+}
+
 function parseModelStartBody(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    const error = new Error("Request body must be a JSON object");
-    error.status = 400;
-    throw error;
+    throw invalidModelRequest("Request body must be a JSON object");
   }
   const allowed = new Set(["switchRunning", "launchOptionSelections"]);
   const unexpected = Object.keys(body).find((key) => !allowed.has(key));
   if (unexpected) {
-    const error = new Error(`Unexpected request field: ${unexpected}`);
-    error.status = 400;
-    throw error;
+    throw invalidModelRequest(`Unexpected request field: ${unexpected}`);
   }
   if (body.switchRunning !== undefined && typeof body.switchRunning !== "boolean") {
-    const error = new Error("switchRunning must be a boolean");
-    error.status = 400;
-    throw error;
+    throw invalidModelRequest("switchRunning must be a boolean");
   }
   const selections = body.launchOptionSelections ?? {};
   if (!selections || typeof selections !== "object" || Array.isArray(selections)) {
-    const error = new Error("launchOptionSelections must be an object");
-    error.status = 400;
-    throw error;
+    throw invalidModelRequest("launchOptionSelections must be an object");
   }
   for (const [optionId, choiceId] of Object.entries(selections)) {
     if (
@@ -615,9 +642,7 @@ function parseModelStartBody(body) {
       typeof choiceId !== "string" ||
       !/^[A-Za-z][A-Za-z0-9._-]*$/.test(choiceId)
     ) {
-      const error = new Error("Launch option and choice IDs are invalid");
-      error.status = 400;
-      throw error;
+      throw invalidModelRequest("Launch option and choice IDs are invalid");
     }
   }
   return {
@@ -632,14 +657,14 @@ app.post("/api/sparks/:id/models/:displayName/start", async (req, res) => {
     if (!spark) return res.status(404).json({ error: "Spark not found" });
     const body = parseModelStartBody(req.body);
     const name = encodeURIComponent(req.params.displayName);
-    res.json(
-      await requestSparkManager(spark, `/models/${name}/start`, {
-        method: "POST",
-        body,
-        timeoutMs: 15 * 60_000,
-        requestId: res.locals.requestId,
-      })
-    );
+    let upstreamStatus = 200;
+    const payload = await requestSparkManager(spark, `/models/${name}/start`, {
+      method: "POST",
+      body,
+      requestId: res.locals.requestId,
+      onResponse: ({ status }) => { upstreamStatus = status; },
+    });
+    sendLifecycleAccepted(res, spark.id, upstreamStatus, payload);
   } catch (err) {
     res.status(err.status || 502).json(
       err.payload || { error: { code: "SPARK_MANAGER_ERROR", message: err.message } }
@@ -652,14 +677,14 @@ app.post("/api/sparks/:id/models/:displayName/stop", async (req, res) => {
     const spark = registry.getSpark(req.params.id);
     if (!spark) return res.status(404).json({ error: "Spark not found" });
     const name = encodeURIComponent(req.params.displayName);
-    res.json(
-      await requestSparkManager(spark, `/models/${name}/stop`, {
-        method: "POST",
-        body: {},
-        timeoutMs: 5 * 60_000,
-        requestId: res.locals.requestId,
-      })
-    );
+    let upstreamStatus = 200;
+    const payload = await requestSparkManager(spark, `/models/${name}/stop`, {
+      method: "POST",
+      body: {},
+      requestId: res.locals.requestId,
+      onResponse: ({ status }) => { upstreamStatus = status; },
+    });
+    sendLifecycleAccepted(res, spark.id, upstreamStatus, payload);
   } catch (err) {
     res.status(err.status || 502).json(
       err.payload || { error: { code: "SPARK_MANAGER_ERROR", message: err.message } }

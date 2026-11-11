@@ -410,7 +410,6 @@ Copy `.env.example` to `.env` if needed:
 | `COMFY_PORT` | `8188` | Default ComfyUI probe port |
 | `SPARK_MANAGER_API_PORT` | `3000` | Loopback Spark Manager API port used by the Models section |
 | `SPARK_MANAGER_API_TOKEN` | _(empty)_ | Optional Spark Manager bearer token; kept in the sparkDash backend |
-| `SPARK_MANAGER_REGISTRY_PATH` | auto-detected | Optional local `registry.json` path as seen by sparkDash; remote registries are read over SSH |
 | `POLL_INTERVAL_GPU` | `2000` | GPU poll (ms) |
 | `POLL_INTERVAL_COMFY` | `2000` | ComfyUI probe poll (ms) |
 | `POLL_INTERVAL_CPU` | `2000` | CPU / RAM poll (ms) |

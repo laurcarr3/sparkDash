@@ -329,6 +329,10 @@ export interface LlmMetrics {
 }
 
 // ─── Spark Manager model registry ───────────────────────
+// Mirrors spark-manager's HTTP API (packages/core/src/index.ts, lifecycle.ts,
+// readiness.ts, runtime.ts, operation-log.ts). Keep field names and nullability
+// in sync with that repository; it is the source of truth.
+
 export interface ModelLaunchOptionChoice {
   id: string;
   label: string;
@@ -344,30 +348,144 @@ export interface ModelLaunchOption {
   choices: ModelLaunchOptionChoice[];
 }
 
+/** A registry entry's readiness probe (GET /models). Credentials and query are already stripped from `url`. */
+export interface ModelReadinessProbe {
+  url: string;
+  /** When set, the endpoint must list this model ID in `data[].id`. */
+  expectedModelId?: string;
+  /** Per-request timeout, 100..60000 (default 2000). */
+  timeoutMs?: number;
+}
+
+/** GET /models entry. */
 export interface RegisteredModel {
   displayName: string;
   workspaceDirectory: string;
+  containerNames?: string[];
+  /** Secret-named environment values arrive as "[REDACTED]". */
   launchOptions?: ModelLaunchOption[];
+  readiness?: ModelReadinessProbe;
 }
 
-export interface SparkManagerCommandResult {
-  exitCode: number;
+export type ModelLifecycleState =
+  | "stopped"
+  | "queued"
+  | "starting"
+  | "running"
+  | "stopping"
+  | "failed"
+  | "unknown";
+
+export type ModelDesiredState = "running" | "stopped";
+export type ModelOperationKind = "start" | "stop";
+export type ModelOperationStatus = "queued" | "running" | "succeeded" | "failed";
+
+/** Container Spark Manager attributes to a model's workspace (Docker view). */
+export interface ModelRuntimeContainer {
+  id: string;
+  name: string | null;
+  running: boolean;
+  restarting: boolean;
+  /** Docker State.Status. */
+  status: string | null;
+  /** Set only for stopped containers. */
+  exitCode: number | null;
+  oomKilled: boolean;
+  restartCount: number;
+  /** Null for Docker's zero time. */
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface ModelRuntimeStatus {
+  /** False when Docker could not be queried. This does not mean the model is stopped. */
+  observed: boolean;
+  /** A container owned by the workspace is running. */
+  present: boolean;
+  /** Running and recently exited containers, newest first. */
+  containers: ModelRuntimeContainer[];
+  /** The Docker error when `observed` is false. */
+  error: string | null;
+}
+
+/** Whether the model's API answers (status `readiness`). */
+export interface ModelReadinessStatus {
+  /** The registry entry has a readiness probe. */
+  configured: boolean;
+  ready: boolean;
+  /**
+   * "probe": the configured probe decided. "start-command": no probe, so the
+   * API's own ./start.sh run decided. "none": no probe and not started by the
+   * API, so running containers count as ready.
+   */
+  source: "probe" | "start-command" | "none";
+  /** Probe URL without userinfo or query; null without a probe. */
+  endpoint: string | null;
+  httpStatus: number | null;
+  servedModelIds: string[];
+  /** When the probe last ran; null when it was not run. */
+  checkedAt: string | null;
+  /** e.g. "connect ECONNREFUSED 127.0.0.1:8888" or "HTTP 503". */
+  error: string | null;
+}
+
+export type ModelLifecycleErrorCode =
+  | "CONFLICTING_MODEL_STOP_FAILED"
+  | "START_COMMAND_UNAVAILABLE"
+  | "START_COMMAND_FAILED"
+  | "STARTUP_TIMEOUT"
+  | "READINESS_TIMEOUT"
+  | "STOP_COMMAND_UNAVAILABLE"
+  | "STOP_COMMAND_FAILED"
+  | "STOP_TIMEOUT"
+  | "MANAGER_INTERRUPTED"
+  | "INTERNAL_ERROR";
+
+/** A failed operation's error (status `lastError`, operation `error`). */
+export interface ModelLifecycleError {
+  operationId: string;
+  kind: ModelOperationKind;
+  code: ModelLifecycleErrorCode;
+  message: string;
+  at: string;
+  exitCode: number | null;
   signal: string | null;
-  stdout: string;
-  stderr: string;
+  /** True when nothing is left half-running, so the same request can simply be retried. */
+  retrySafe: boolean;
+  /** Last log lines of the failed operation, redacted plain text. */
+  logTail: string[];
 }
 
-export interface RegisteredModelStatus extends RegisteredModel {
-  command?: SparkManagerCommandResult;
-  error?: { message: string };
+export interface ModelOperationSummary {
+  operationId: string;
+  kind: ModelOperationKind;
+  status: ModelOperationStatus;
+}
+
+/** Spark Manager lifecycle status for one model (GET /models/status, GET /models/:name/status). */
+export interface ModelLifecycleStatus {
+  displayName: string;
+  lifecycleState: ModelLifecycleState;
+  /** Containers are running that the API did not start (for example, via the CLI). */
+  externallyManaged: boolean;
+  /** Last requested state; null until the first start or stop since the API started. */
+  desiredState: ModelDesiredState | null;
+  activeOperation: ModelOperationSummary | null;
+  /** Most recent finished operation. */
+  lastOperation: ModelOperationSummary | null;
+  /** Most recent failure; a later success keeps it. */
+  lastError: ModelLifecycleError | null;
+  runtime: ModelRuntimeStatus;
+  readiness: ModelReadinessStatus;
 }
 
 export interface RegisteredModelsResponse {
   models: RegisteredModel[];
 }
 
-export interface RegisteredModelStatusesResponse {
-  models: RegisteredModelStatus[];
+/** GET /models/status. */
+export interface ModelLifecycleStatusesResponse {
+  models: ModelLifecycleStatus[];
 }
 
 export interface StartRegisteredModelRequest {
@@ -375,10 +493,106 @@ export interface StartRegisteredModelRequest {
   launchOptionSelections?: Record<string, string>;
 }
 
+/** 202 body returned by start and stop. */
 export interface ModelLifecycleResponse {
-  model: RegisteredModel | { displayName: string };
-  stoppedModels?: RegisteredModel[];
-  command: SparkManagerCommandResult;
+  operationId: string;
+  kind: ModelOperationKind;
+  model: string;
+  desiredState: ModelDesiredState;
+  lifecycleState: "queued";
+  operationStatus: ModelOperationStatus;
+  statusUrl: string;
+  modelStatusUrl: string;
+}
+
+/**
+ * Codes in `{ error: { code, message, ...details } }` responses from Spark
+ * Manager (and the sparkDash proxy in front of it). Kept open (`string`)
+ * because the proxy adds its own codes such as SPARK_MANAGER_UNAVAILABLE.
+ */
+export type SparkManagerRequestErrorCode =
+  | "INVALID_MODEL_NAME"
+  | "MODEL_NOT_FOUND"
+  | "INVALID_REQUEST"
+  | "INVALID_LAUNCH_OPTIONS"
+  | "INVALID_OPERATION_ID"
+  | "OPERATION_NOT_FOUND"
+  | "INVALID_LOG_QUERY"
+  | "INVALID_JSON"
+  | "BODY_TOO_LARGE"
+  | "JSON_REQUIRED"
+  | "UNAUTHORIZED"
+  | "OPERATION_IN_PROGRESS"
+  | "LIFECYCLE_BUSY"
+  | "MODEL_ALREADY_RUNNING"
+  | "LIFECYCLE_LOCK_HELD"
+  | "RUNTIME_INSPECTION_FAILED"
+  | "NOT_FOUND"
+  | "INTERNAL_ERROR";
+
+/** Details of 409 OPERATION_IN_PROGRESS and LIFECYCLE_BUSY. */
+export interface ModelOperationConflictDetails {
+  activeOperationId: string;
+  activeModel: string;
+}
+
+/**
+ * Details of 409 MODEL_ALREADY_RUNNING. Spark Manager sends whole registry
+ * entries; the sparkDash proxy reduces each to its display name and workspace
+ * so unmasked launch environments never reach the browser.
+ */
+export interface ModelAlreadyRunningDetails {
+  runningModels: Pick<RegisteredModel, "displayName" | "workspaceDirectory">[];
+}
+
+/** Details of 409 LIFECYCLE_LOCK_HELD. */
+export interface LifecycleLockHeldDetails {
+  ownerPid?: number;
+}
+
+export interface ModelLifecycleLogLine {
+  /** Increases monotonically per model, across operations. */
+  seq: number;
+  at: string;
+  stream: "stdout" | "stderr" | "manager";
+  text: string;
+}
+
+export interface ModelLifecycleLogsResponse {
+  displayName: string;
+  /** null if the model has had no operation since the API started. */
+  operationId: string | null;
+  operationKind: ModelOperationKind | null;
+  operationStatus: ModelOperationStatus | null;
+  lines: ModelLifecycleLogLine[];
+  /** Pass back as `after` to receive only newer lines. */
+  nextAfter: number;
+  /** Lines of this operation after `after` were already dropped. */
+  truncated: boolean;
+  hasMore: boolean;
+}
+
+export interface ModelOperationView {
+  operationId: string;
+  kind: ModelOperationKind;
+  displayName: string;
+  status: ModelOperationStatus;
+  /** x-request-id of the request that created it. */
+  requestId: string | null;
+  options: {
+    switchRunning?: boolean;
+    launchOptionSelections?: Record<string, string>;
+  };
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** null if no script ran. */
+  command: { exitCode: number | null; signal: string | null } | null;
+  error: ModelLifecycleError | null;
+}
+
+export interface ModelOperationResponse {
+  operation: ModelOperationView;
 }
 
 /** One UTC day of busy tok/s rollups (null avg = no busy samples). */
